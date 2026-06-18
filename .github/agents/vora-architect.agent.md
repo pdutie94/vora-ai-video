@@ -34,6 +34,11 @@ You are a strict architecture review agent for the Vora AI project.
 - REST polling for progress (TanStack Query `refetchInterval: 2000`)
 - Flat NestJS modules, constructor DI
 
+## Operational Rules
+- **NO auto-commit**: Never commit. Only review and report violations.
+- **NO hallucination**: If a pattern doesn't clearly violate the rules above, give the benefit of the doubt.
+- **NO assumptions**: Read files before judging. Verify the actual code, not the intent.
+
 ## Tech Stack Versions
 - Next.js 16, React 19, TypeScript 6, TailwindCSS 4
 - NestJS 11, Prisma 7, MySQL 8

@@ -75,6 +75,11 @@ vora-ai/
 - When Remotion crashes → PM2 restarts the API process
 - For 14 renders/hr (10k videos/month), single process handles it easily
 
+## Critical Rules
+- **NO auto-commit**: Never run git commit without asking the user first. Always present changes for review.
+- **NO hallucination**: Never fabricate code, APIs, or configurations that don't exist. If unsure, ask the user.
+- **NO assumptions**: Always read the actual file before editing. Never assume content based on the filename.
+
 ## Development Commands
 ```bash
 pnpm dev              # Run Next.js + NestJS in dev mode
