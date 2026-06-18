@@ -11,15 +11,15 @@ applyTo: "apps/api/prisma/**"
 ## Models
 
 ### User
-- id (cuid), email (unique), name?, avatarUrl?, credits (default 0), role ("user"|"admin")
-- passwordHash (bcrypt), refreshTokenHash (bcrypt hash of refresh token)
+- id (cuid), email (unique), name?, credits (default 0), role ("user"|"admin")
+- passwordHash (bcrypt)
 - Relations: projects Project[]
 - Indexes: email
 
 ### Project
 - id (cuid), userId (FK), name, status (ProjectStatus)
-- templateId (FK→Template)?, productName?, productDesc?, metadata (Json)?, deletedAt?
-- Relations: user User, assets ProjectAsset[], jobs Job[], template Template?
+- templateId (String? — references hardcoded template slug), productName?, productDesc?, metadata (Json)?
+- Relations: user User, assets ProjectAsset[], jobs Job[]
 - Indexes: (userId, status), (userId, createdAt)
 
 ### ProjectAsset
@@ -31,10 +31,6 @@ applyTo: "apps/api/prisma/**"
 - startedAt?, completedAt?
 - Indexes: (projectId, type), (projectId, status)
 
-### Template
-- id (cuid), name, slug (unique), description?, thumbnailPath?, config (Json), isActive
-- Relations: projects Project[]
-
 ## Enums
 - ProjectStatus: PENDING, PROCESSING, COMPLETED, FAILED
 - JobType: ANALYZE_PRODUCT, GENERATE_ANGLE, GENERATE_SCRIPT, GENERATE_VOICE, GENERATE_SUBTITLE, RENDER_VIDEO, CLEANUP
@@ -43,7 +39,8 @@ applyTo: "apps/api/prisma/**"
 
 ## Rules
 - NO Session/Account tables (JWT auth, not Better Auth)
+- NO Template table (1 template hardcoded in code — no DB model needed)
 - NO CreditTransaction/SubscriptionPlan (no billing in MVP)
-- Always soft-delete Project via deletedAt (DateTime?), never hard delete
+- Hard delete on Project (no deletedAt)
 - Job.metadata stores accumulated pipeline data as JSON
 - All queries scoped to userId — never trust client-side IDs

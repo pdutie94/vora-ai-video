@@ -44,8 +44,9 @@
                            │                    │
                            ▼                    ▼
                      ┌──────────┐      ┌──────────────┐
-                     │WebSocket │      │   Remotion   │
-                     │ Gateway  │      │   Renderer   │
+                     │  REST    │      │   Remotion   │
+                     │  Polling │      │  (inline in  │
+                     │  (2s)    │      │   worker)    │
                      └──────────┘      └──────┬───────┘
                                                 ▼
                                           ┌──────────────┐
@@ -64,7 +65,7 @@
 - PM2 process management (no Docker, no K8s)
 - MySQL (already installed)
 - Redis (already installed)
-- 2 BullMQ queues (not 7)
+- 1 BullMQ queue (not 7)
 
 ### Package Versions (Latest as of June 2026)
 
@@ -83,16 +84,12 @@
 | `@nestjs/jwt` | 11.0.2 | JWT auth |
 | `@nestjs/passport` | 11.0.5 | Auth guards |
 | `@nestjs/config` | 4.0.4 | Environment config |
-| `@nestjs/platform-socket.io` | 11.1.27 | WebSocket server |
-| `@nestjs/swagger` | 11.4.4 | API docs |
-| `@nestjs/serve-static` | 5.0.5 | Static file serving |
 | **Database** | | |
 | `prisma` / `@prisma/client` | 7.8.0 | ORM |
 | `mysql2` | 3.22.5 | MySQL driver |
 | **Queue** | | |
 | `bullmq` | 5.79.0 | Redis-backed job queues |
 | `ioredis` | 5.11.1 | Redis client |
-| `@bull-board/nestjs` | 8.0.1 | Queue admin dashboard |
 | **Video** | | |
 | `remotion` / `@remotion/renderer` | 4.0.481 | Server-side video rendering |
 | **AI** | | |
@@ -167,19 +164,17 @@ Auth lives entirely inside NestJS — no external auth SDK:
 
 ```
 NestJS
-├── JWT (access token, 15min expiry)
-├── Refresh Token (30 day expiry, hashed in DB)
-└── HttpOnly cookie (refresh token) + Authorization header (JWT)
+├── JWT (access token, 7-day expiry)
+└── Authorization header: Bearer <token>
 
-Next.js reads JWT from cookie → attaches to API calls
-No auth sync needed between frontend and backend.
+No refresh token. No HttpOnly cookie. No session.
 ```
 
 **Why NOT Better Auth?**
 - Better Auth requires running alongside Next.js and syncing to NestJS
 - Every auth check needs to cross two services → more latency, more bug surface
 - NestJS has first-class JWT support via `@nestjs/jwt` and `@nestjs/passport`
-- Refresh token rotation + HttpOnly cookies are standard security patterns
+- Refresh tokens add complexity for zero benefit at 100 customers. 7-day JWT is fine.
 - Solo founder doesn't need multi-provider OAuth (just email/password for MVP)
 
 ### Process Architecture (PM2 Ecosystem)
@@ -198,13 +193,11 @@ Production (PM2 `ecosystem.config.js`):
 ```
 PM2 Process Name │ Command                        │ Port  │ Restart
 ─────────────────┼────────────────────────────────┼───────┼───────
-vora-web         │ pnpm --filter @vora/web start  │ 3000  │ on-fail
 vora-api         │ node dist/apps/api/src/main    │ 4000  │ on-fail
-vora-worker      │ node dist/apps/api/src/worker  │ —     │ on-fail
-vora-renderer    │ node apps/renderer/dist/index   │ —     │ always
+vora-web         │ pnpm --filter @vora/web start  │ 3000  │ on-fail
 ```
 
-**Note**: The renderer is a **completely separate process** from the worker — it lives in its own `apps/renderer` directory with its own `package.json`. It only imports Remotion + the shared types package. When Remotion crashes (Chromium OOM, FFmpeg bug), only the renderer restarts — API and worker stay online. The renderer connects to the same Redis for BullMQ and the same DB via Prisma.
+**Note**: Remotion rendering runs inline in the API process — no separate renderer process. `renderMedia()` is called directly from the queue job handler. When Remotion crashes (OOM, FFmpeg bug), PM2 restarts the entire API process. For 14 renders/hr (10k videos/month), a single process handles this easily.
 
 ---
 
@@ -242,18 +235,8 @@ vora-renderer    │ node apps/renderer/dist/index   │ —     │ always
        │               │ completedAt      │       └──────────────────┘
        │               └──────────────────┘
        │
-       │       ┌──────────────────┐       ┌──────────────────────┐
-       │       │ CreditTransaction│       │   SubscriptionPlan   │
-       │       │──────────────────│       │──────────────────────│
-       │       │ id (PK)          │       │ id (PK)              │
-       ├───────│ userId (FK)      │       │ name                 │
-               │ amount           │       │ slug                 │
-               │ type (ENUM)      │       │ price                │
-               │ description      │       │ creditsPerMonth      │
-               │ reference (JSON) │       │ features (JSON)      │
-               │ createdAt        │       │ isActive             │
-               └──────────────────┘       │ createdAt            │
-                                           └──────────────────────┘
+       # Note: No CreditTransaction/SubscriptionPlan (removed from MVP)
+       # Note: No Template model (1 template hardcoded in code)
 ```
 
 ### Prisma Models
@@ -318,9 +301,8 @@ model User {
   avatarUrl  String?
   credits    Int      @default(0)
   role       String   @default("user") // "user" | "admin"
-  // Auth — NestJS-managed JWT
-  passwordHash     String?  // bcrypt hash
-  refreshTokenHash String?  // bcrypt hash of current refresh token (never store raw token)
+  // Auth — NestJS-managed JWT (7-day expiry, no refresh token)
+  passwordHash String?  // bcrypt hash
 
   projects  Project[]
   createdAt DateTime @default(now())
@@ -390,22 +372,8 @@ model Job {
   @@index([projectId, status])
 }
 
-model Template {
-  id             String   @id @default(cuid())
-  name           String
-  slug           String   @unique
-  description    String?
-  thumbnailPath  String?
-  config         Json     // Scene definitions, durations, styling
-  isActive       Boolean  @default(true)
-
-  projects Project[]
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-}
-
 // REMOVED from MVP:
+// Template — 1 template hardcoded in code, no DB table needed
 // CreditTransaction — post-MVP with Stripe
 // SubscriptionPlan — post-MVP with Stripe
 // Admin grants credits manually via `UPDATE user SET credits = credits + N`
@@ -423,7 +391,7 @@ model Template {
 - `Job(projectId, type)` — find specific job for a project
 - `Job(projectId, status)` — check all jobs for a project
 - `ProjectAsset(projectId, type)` — get assets of a specific type for a project
-- `User(refreshTokenHash)` — quick refresh token lookup
+- `User(email)` — login lookup
 
 ---
 
@@ -435,26 +403,14 @@ BullMQ supports job names natively via `worker.process(name, handler)`. No `swit
 
 ```
 ┌──────────────────────────────────────────────────┐
-│              Queue: generation                   │
-│  (Fast jobs — AI calls, file operations)         │
+│           Queue: video-pipeline                  │
+│  (All steps — AI, TTS, Remotion all inline)      │
 │                                                  │
-│  Named jobs (each adds data for the next):       │
-│  analyze  →  script  →  voice  →  subtitle      │
+│  Named jobs (all in 1 queue, 1 concurrency):     │
+│  analyze → script → voice → subtitle → render → cleanup │
 │                                                  │
-│  Concurrency: 5                                  │
-│  Retries: 3 (exponential backoff)                │
-└──────────────────────┬───────────────────────────┘
-                       │ on 'subtitle' success, enqueue to:
-                       ▼
-┌──────────────────────────────────────────────────┐
-│              Queue: render                       │
-│  (Heavy job — Remotion rendering)                │
-│                                                  │
-│  Named jobs:                                     │
-│  render  →  cleanup                              │
-│                                                  │
-│  Concurrency: 1 (CPU-bound)                      │
-│  Retries: 2 (long timeout)                       │
+│  Concurrency: 2                                  │
+│  Retries: 3 (exponential backoff) for all jobs   │
 └──────────────────────────────────────────────────┘
 ```
 
@@ -523,36 +479,33 @@ Worker picks up job 'subtitle':
   14. Read script + voice timing from DB
   15. Generate SRT → save via StorageProvider
   16. Write subtitle path to Job.metadata
-  17. Create Render Job record, enqueue to 'render' queue
-  │
-  ▼
-Renderer (separate PM2 process) picks up job 'render':
+  17. Create next Job record, enqueue 'render'
+
+Worker picks up job 'render':
   18. Read all accumulated data from DB
-  19. Remotion renderMedia() with all data
+  19. Remotion renderMedia() with all data (inline, same process)
   20. Save MP4 via StorageProvider
   21. Write video path to Job.metadata
   22. Create next Job record, enqueue 'cleanup'
 
-Renderer picks up job 'cleanup':
+Worker picks up job 'cleanup':
   23. Update Project status = COMPLETED
   24. Remove temp files
-  25. Emit WebSocket event to frontend
+  (Frontend sees COMPLETED on next poll)
 ```
 
-### Progress Tracking
+### Progress Tracking (REST Polling)
 
 Each step updates:
-1. **BullMQ job.progress(n)** — tracks within-queue progress (0-100)
-2. **Job record in DB** — updates `progress` and `status` columns
-3. **WebSocket event** — emitted to frontend in real-time
+1. **Job record in DB** — updates `progress` and `status` columns
+2. **Project status** — updates `Project.status` on COMPLETED/FAILED
 
-Frontend subscribes via WebSocket to `project:{projectId}:progress` channel.
+Frontend polls `GET /api/projects/:id` every 2 seconds via TanStack Query `refetchInterval`.
 
 ### Retry & Error Strategy
 | Queue | Max Retries | Backoff | On Final Failure |
 |-------|-------------|---------|------------------|
-| `generation` | 3 | 5s → 30s → 120s | Mark project FAILED, refund credits |
-| `render` | 2 | 30s → 300s | Mark project FAILED, refund credits |
+| `video-pipeline` | 3 | 5s → 30s → 120s | Mark project FAILED, refund credits |
 
 ---
 
@@ -585,9 +538,9 @@ apps/api/src/
 │   │
 │   ├── videos/
 │   │   ├── videos.module.ts
-│   │   ├── videos.controller.ts      # Generate, progress, download
-│   │   ├── videos.service.ts
-│   │   └── generation.gateway.ts     # WebSocket gateway
+│   │   ├── videos.controller.ts      # Generate, progress (via DB), download
+│   │   └── videos.service.ts
+│   │   # No WebSocket gateway — REST polling via GET /api/projects/:id
 │   │
 │   ├── templates/
 │   │   ├── templates.module.ts
@@ -602,33 +555,22 @@ apps/api/src/
 │   └── credits/
 │       ├── credits.module.ts
 │       └── credits.service.ts         # Read balance, check, deduct, admin grant
-│   # NOTE: No billing/stripe module — removed from MVP
+│   # NOTE: No billing/stripe/Bull Board — removed from MVP
 │
 ├── workers/
-│   ├── generation.worker.ts          # Queue consumer (analyze, script, voice, subtitle)
+│   ├── video-pipeline.worker.ts      # Queue consumer (all named jobs)
 │   └── queue.service.ts             # Queue management
 │
-├── admin/
-│   └── bull-board.controller.ts     # @bull-board dashboard at /admin/queues
-│
-└── renderer/                          # Completely separate app (apps/renderer/)
-    ├── src/
-    │   ├── index.ts                   # Bootstrap BullMQ consumer + Remotion
-    │   ├── renderer.service.ts        # Remotion renderMedia() wrapper
-    │   ├── templates/                 # Remotion composition templates
-    │   │   ├── product-review.tsx
-    │   │   ├── ugc-style.tsx
-    │   │   ├── problem-solution.tsx
-    │   │   ├── flash-sale.tsx
-    │   │   └── features-showcase.tsx
-    │   └── scenes/
-    │       ├── title-scene.tsx
-    │       ├── image-scene.tsx
-    │       ├── text-scene.tsx
-    │       ├── cta-scene.tsx
-    │       └── outro-scene.tsx
-    ├── package.json
-    └── tsconfig.json
+├── renderer/                          # Inline, inside apps/api (not separate)
+│   ├── renderer.service.ts           # Remotion renderMedia() wrapper
+│   ├── templates/
+│   │   └── product-review.tsx        # MVP: 1 template
+│   └── scenes/
+│       ├── title-scene.tsx
+│       ├── image-scene.tsx
+│       ├── text-scene.tsx
+│       ├── cta-scene.tsx
+│       └── outro-scene.tsx
 │
 └── common/
     ├── filters/
@@ -672,8 +614,7 @@ GET    /api/templates/:id          — Get template details + scenes
 Video Generation
 ─────────────────────────────────────────────────────
 POST   /api/projects/:id/generate  — Start generation pipeline
-WS     /ws                         — WebSocket namespace (subscribe to `project:{id}:progress`)
-GET    /api/projects/:id/progress  — Poll current progress (fallback)
+GET    /api/projects/:id          — Poll project status + progress (frontend polls every 2s)
 GET    /api/projects/:id/video     — Get rendered video metadata + stream URL
 GET    /api/projects/:id/download  — Download rendered MP4
 
@@ -709,43 +650,27 @@ GET    /api/billing/credits        — Get credit balance
 }
 ```
 
-### WebSocket Gateway (Replaces SSE)
+### Progress Tracking (REST Polling)
 
-NestJS `@nestjs/websockets` provides first-class WebSocket support. A single gateway handles all real-time events:
+No WebSocket, no SSE. Frontend polls `GET /api/projects/:id` every 2 seconds during active generation:
 
 ```typescript
-@WebSocketGateway({
-  namespace: '/ws',
-  cors: { origin: process.env.FRONTEND_URL }
-})
-export class GenerationGateway {
-  @SubscribeMessage('subscribe')
-  handleSubscribe(client: Socket, payload: { projectId: string }) {
-    // Join room: client joins `project:{projectId}` room
-    client.join(`project:${payload.projectId}`);
-  }
-
-  // Called from workers after each pipeline step
-  emitProgress(projectId: string, data: ProgressEvent) {
-    this.server.to(`project:${projectId}`).emit('progress', data);
-  }
-
-  emitCompleted(projectId: string, data: CompleteEvent) {
-    this.server.to(`project:${projectId}`).emit('completed', data);
-  }
-
-  emitFailed(projectId: string, data: ErrorEvent) {
-    this.server.to(`project:${projectId}`).emit('failed', data);
-  }
-}
+// Frontend: TanStack Query auto-polling
+const { data } = useQuery({
+  queryKey: ['projects', projectId],
+  queryFn: () => fetch(`/api/projects/${projectId}`).then(r => r.json()),
+  // Poll every 2s while project is processing
+  refetchInterval: (data) =>
+    data?.status === 'PROCESSING' ? 2000 : false,
+});
 ```
 
-**Why WebSocket over SSE?**
-- BullMQ events → emit socket naturally (no polling wrapper)
-- Supports multi-tab sync (same user, different tabs)
-- Future: admin monitoring dashboard, real-time notification system
-- NestJS `@nestjs/websockets` integrates with the same DI container — negligible complexity
-- SSE requires custom `Observable` + manual reconnection logic; WebSocket handles reconnection client-side
+**Why REST polling over WebSocket?**
+- Zero socket infrastructure — no socket.io, no reconnection, no rooms
+- For 100 concurrent customers: ~50 req/s, trivial for a single VPS
+- TanStack Query handles caching + deduplication automatically
+- No client-side connection management code
+- Frontend just reads `data.status` and renders the right UI
 
 ### Error Codes
 | Code | HTTP Status | Description |
@@ -765,7 +690,7 @@ export class GenerationGateway {
 
 ### Architecture Overview
 
-Remotion runs as a **library** within the NestJS renderer process (not a separate service). The `@remotion/renderer` package's `renderMedia()` function is called directly from the `render` queue processor.
+Remotion runs as a **library** within the NestJS worker process. The `@remotion/renderer` package's `renderMedia()` function is called directly from the queue job handler — no separate renderer process.
 
 ```
 'render' queue job received
@@ -782,8 +707,9 @@ renderer.service.ts
   │     ▼
   ├── MP4 written to temp directory
   ├── Move via StorageProvider.save() to /storage/{projectId}/video.mp4
-  ├── Emit WebSocket 'completed' event via GenerationGateway
+  ├── Update Project.status = COMPLETED in DB
   └── Return path → stored in ProjectAsset record
+  (Frontend sees COMPLETED on next poll)
 ```
 
 ### Template System
@@ -839,15 +765,13 @@ Each template is built from reusable scene components:
 | Audio codec | aac | Universal audio format |
 | Duration | 15-60s | Short-form content |
 
-### Template Catalog (MVP — 5 Templates)
+### Template Catalog (MVP — 1 Template)
 
 | Template | Slug | Vibe | Scenes | Duration |
 |----------|------|------|--------|----------|
 | Product Review | `product-review` | Honest review, comparison | Hook → Showcase → Verdict → CTA | 30s |
-| UGC Style | `ugc-style` | Authentic, raw, unboxing feel | Hook → Unboxing → Up close → CTA | 20s |
-| Problem/Solution | `problem-solution` | Pain point → solution | Problem → Solution → Features → CTA | 25s |
-| Flash Sale | `flash-sale` | Urgency, discounts, limited | Timer → Offer → Product → CTA | 15s |
-| Feature Showcase | `features-showcase` | Clean feature walkthrough | Intro → Feature 1 → Feature 2 → Outro | 40s |
+
+**Why only 1?** Building 5 templates before product-market fit is premature. Add templates only when customers request them.
 
 ---
 
@@ -1224,36 +1148,20 @@ Without this discipline, `fs.writeFile` calls will be scattered across 20+ files
 
 ## 10. Frontend Architecture (Next.js 16)
 
-### WebSocket Client Hook
+### Progress Tracking (REST Polling)
+
+No WebSocket. TanStack Query `refetchInterval` handles polling:
 
 ```typescript
-// apps/web/src/hooks/use-generation.ts
-const useGenerationProgress = (projectId: string) => {
-  const [progress, setProgress] = useState<ProgressEvent | null>(null);
+// apps/web/src/hooks/use-projects.ts
+const useProject = (id: string) => useQuery({
+  queryKey: ['projects', id],
+  queryFn: () => fetch(`/api/projects/${id}`).then(r => r.json()),
+  refetchInterval: (data) =>
+    data?.status === 'PROCESSING' ? 2000 : false,
+});
 
-  useEffect(() => {
-    const socket = io(`${process.env.NEXT_PUBLIC_WS_URL}/ws`, {
-      withCredentials: true,
-    });
-
-    socket.emit('subscribe', { projectId });
-
-    socket.on('progress', (data) => setProgress(data));
-    socket.on('completed', (data) => {
-      setProgress(data);
-      // Invalidate TanStack Query cache
-      queryClient.invalidateQueries({ queryKey: ['projects', projectId] });
-    });
-    socket.on('failed', (data) => {
-      setProgress(data);
-      queryClient.invalidateQueries({ queryKey: ['projects', projectId] });
-    });
-
-    return () => { socket.disconnect(); };
-  }, [projectId]);
-
-  return progress;
-};
+// Component just reads data.status — no socket code needed
 ```
 
 ### Route Design
@@ -1456,26 +1364,9 @@ module.exports = {
       exec_mode: 'fork',
       max_memory_restart: '1G',
     },
-    {
-      name: 'vora-worker',
-      cwd: './apps/api',
-      script: 'dist/src/worker.js',
-      env: { NODE_ENV: 'production', WORKER_MODE: 'true' },
-      instances: 1,
-      exec_mode: 'fork',
-      max_memory_restart: '1G',
-      autorestart: true,  // PM2 restarts on OOM/uncaught exception/SIGSEGV
-    },
-    {
-      name: 'vora-renderer',
-      cwd: './apps/renderer',
-      script: 'dist/index.js',
-      env: { NODE_ENV: 'production' },
-      instances: 1,
-      exec_mode: 'fork',
-      max_memory_restart: '4G',  // Remotion is memory-intensive
-      autorestart: true,
-    },
+    # Note: worker + renderer run inside the same API process.
+    # BullMQ handles job distribution internally.
+    # No separate worker or renderer PM2 processes needed.
   ],
 };
 ```
@@ -1515,8 +1406,7 @@ REDIS_URL=redis://localhost:6379
 
 # Auth (NestJS JWT)
 JWT_SECRET=your-secret-here-rotate-in-production
-JWT_EXPIRES_IN=15m
-JWT_REFRESH_EXPIRES_IN=30d
+JWT_EXPIRES_IN=7d
 
 # AI Providers
 OPENAI_API_KEY=sk-...
@@ -1527,12 +1417,7 @@ UPLOAD_PATH=./uploads
 MAX_FILE_SIZE=10485760
 
 # Queue
-GENERATION_QUEUE_CONCURRENCY=5
-RENDER_QUEUE_CONCURRENCY=1
-
-# Bull Board (admin dashboard)
-BULL_BOARD_USERNAME=admin
-BULL_BOARD_PASSWORD=your-password-here
+VIDEO_PIPELINE_CONCURRENCY=2
 
 # URLs (for CORS, redirects)
 FRONTEND_URL=http://localhost:3000
@@ -1540,7 +1425,6 @@ API_URL=http://localhost:4000
 
 # Next.js (.env.local for apps/web/)
 NEXT_PUBLIC_API_URL=http://localhost:4000
-NEXT_PUBLIC_WS_URL=http://localhost:4000
 ```
 
 ---
@@ -1556,7 +1440,7 @@ NEXT_PUBLIC_WS_URL=http://localhost:4000
 | 1.3 | Scaffold `apps/api` with NestJS CLI: AppModule, health endpoint, ConfigService | Step 1.1 |
 | 1.4 | Scaffold `apps/web` with `create-next-app`: TypeScript, Tailwind, App Router, shadcn/ui init | Step 1.1 |
 | 1.5 | Configure Prisma: `schema.prisma` with all models, `.env`, `prisma generate` | Step 1.3 |
-| 1.6 | Implement JWT auth: `@nestjs/jwt`, `@nestjs/passport`, register/login/refresh/logout endpoints | Step 1.3 |
+| 1.6 | Implement JWT auth: `@nestjs/jwt`, `@nestjs/passport`, register/login/me endpoints (7d JWT, no refresh token) | Step 1.3 |
 | 1.7 | Set up NestJS project structure: global exception filter, jwt-auth guard, `@CurrentUser()` decorator | Step 1.6 |
 | 1.8 | Set up Next.js project structure: dashboard layout, sidebar, topbar, API client | Step 1.4 |
 | 1.9 | Configure BullMQ: queue definitions, queue service, basic worker scaffold | Step 1.3 |
@@ -1575,7 +1459,7 @@ NEXT_PUBLIC_WS_URL=http://localhost:4000
 | 2.7 | **Generate Endpoint**: Validate credits → create Job records → enqueue to BullMQ | Step 1.9, 2.1 |
 | 2.8 | **AI Service**: OpenAI integration for product analysis, angle generation, script generation | Step 1.3 |
 | 2.9 | **Pipeline Worker (AI)**: Video pipeline worker with ANALYZE → ANGLE → SCRIPT steps | Step 2.8, 1.9 |
-| 2.10 | **WebSocket Gateway**: NestJS WebSocket gateway, event emission from workers | Step 2.7 |
+| 2.10 | **Progress Polling**: Set up TanStack Query `refetchInterval` on project detail, handle PROCESSING/COMPLETED/FAILED states | Step 2.7 |
 
 ### Sprint 3: Video Pipeline (Week 5-6)
 
@@ -1586,7 +1470,7 @@ NEXT_PUBLIC_WS_URL=http://localhost:4000
 | 3.3 | **Remotion Setup**: Install `@remotion/renderer`, create template compositions | Step 1.3 |
 | 3.4 | **Template Compositions**: Build 5 template components with scene system | Step 3.3 |
 | 3.5 | **Render Service**: `renderer.service.ts` — `renderMedia()` wrapper with input props | Step 3.4 |
-| 3.6 | **Render App**: Create `apps/renderer` with BullMQ consumer + Remotion, connect to 'render' queue | Step 3.5, 1.9 |
+| 3.6 | **Render Handler**: Add `renderMedia()` call to queue worker — Remotion runs inline, no separate process | Step 3.5, 1.9 |
 | 3.7 | **CLEANUP Step**: Update project status, move files to storage, clean temp | Step 3.6 |
 | 3.8 | **Video Player UI**: In-browser MP4 player, download button | Step 3.7 |
 | 3.9 | **Generation Progress UI**: Animated progress bar, step status list, cancel | Step 2.10 |
@@ -1601,22 +1485,20 @@ NEXT_PUBLIC_WS_URL=http://localhost:4000
 | 4.3 | **Form Validation**: Client-side (Zod) + server-side, inline error messages | None |
 | 4.4 | **Responsive Design**: Mobile layout for dashboard, project wizard, billing | None |
 | 4.5 | **Soft Delete**: Projects list filtered, deletion confirmation dialog | Step 2.1 |
-| 4.6 | **WebSocket Polish**: Reconnection handling, multi-tab sync, loading states | Step 2.10 |
-| 4.7 | **Provider Swap Test**: Verify changing SCRIPT_PROVIDER env var works | Step 2.8 |
+| 4.6 | **Provider Swap Test**: Verify changing SCRIPT_PROVIDER env var works | Step 2.8 |
 
 # NOTE: Stripe / Billing / Subscriptions removed from MVP.
 # Admin manually grants credits via DB: UPDATE user SET credits = credits + N WHERE email = '...'
 # Add Stripe only after first paying customer.
 
-### Sprint 5: Production Readiness (Week 9-10)
+### Sprint 5: Launch (Week 9-10)
 
 | Step | Description | Dependencies |
 |------|-------------|-------------|
 | 5.1 | **Nginx Config**: Reverse proxy config, SSL via Let's Encrypt, static file serving | None |
-| 5.2 | **PM2 Setup**: Production ecosystem config, auto-start on boot, log rotation | None |
+| 5.2 | **PM2 Setup**: Production ecosystem config (2 processes), auto-start on boot, log rotation | None |
 | 5.3 | **Error Tracking**: Sentry/Raygun integration for API + Frontend | None |
-| 5.4 | **Bull Board**: Install `@bull-board`, add admin route `/admin/queues` with auth | None |
-| 5.5 | **Rate Limiting**: Token bucket per user/IP on generate endpoint | None |
+| 5.4 | **Rate Limiting**: Token bucket per user/IP on generate endpoint | None |
 | 5.5 | **Security Audit**: CORS, Helmet headers, SQL injection (Prisma safe), upload validation | None |
 | 5.6 | **Performance**: Redis caching for templates, image optimization, DB query optimization | None |
 | 5.7 | **Load Testing**: k6/artillery script for generation pipeline, tune concurrency | None |
@@ -1632,17 +1514,19 @@ NEXT_PUBLIC_WS_URL=http://localhost:4000
 |----------|--------|-----------|
 | Storage | Local filesystem (MVP) → S3 (post-MVP) | Zero cloud dependency until revenue proves need. All code goes through `StorageProvider` — no raw `fs` calls |
 | Database | MySQL (as specified) | Already installed, no extra setup |
-| Queues | 2 BullMQ queues (`generation`, `render`) with named jobs | Job names (`analyze`, `script`, `voice`, etc.) eliminate `switch(step)` boilerplate |
-| AI Model | GPT-4o-mini via `ScriptProvider` interface | 30x cheaper than GPT-4o. Swap to Claude/Gemini by changing `.env` |
-| TTS | OpenAI TTS via `VoiceProvider` interface | 20x cheaper than ElevenLabs. Swap by changing `.env` |
-| Real-time | WebSocket (not SSE) | NestJS native support. BullMQ events → emit naturally. Multi-tab. Future admin panel |
-| Auth | NestJS JWT + refresh token | No external SDK. Self-contained. HttpOnly cookie + Bearer token |
+| Queues | 1 BullMQ queue (`video-pipeline`) with named jobs | Named jobs eliminate `switch(step)`. 1 queue is simpler than 2. Same retry for all steps |
+| AI Model | Gemini 2.5 Flash / Claude Sonnet via `ScriptProvider` | Best quality/price as of 2026. Swap via `.env` |
+| TTS | OpenAI TTS via `VoiceProvider` | 20x cheaper than ElevenLabs. Swap via `.env` |
+| Real-time | REST polling (not WebSocket, not SSE) | For 100 customers, ~50 req/s. Zero socket infrastructure. TanStack Query handles polling |
+| Auth | NestJS JWT (7d expiry, no refresh token) | Simple. 100 customers login once a week. Refresh tokens add zero value at this scale |
 | Monorepo | pnpm workspaces (no Turbo) | Turborepo adds config overhead without proven need |
-| Remotion | Library mode in NestJS renderer process (not API process) | CPU-heavy rendering won't block API requests |
-| Provider Adapters | Interface-based (Script, Voice, Image, Video) | Swap providers via `.env`. No code changes needed |
+| Remotion | Inline in worker (not separate process) | 14 renders/hr — single process handles it. When it crashes, PM2 restarts |
+| Provider Adapters | Interface-based (Script, Voice) | Only 2 interfaces for MVP. Swap providers via `.env`. No code changes needed |
+| Templates | 1 hardcoded template (no DB table) | Building 5 templates before customers is wasteful. Add more on demand |
 | Billing | Removed from MVP | Admin grants credits manually via DB. Add Stripe after first paying customer |
 | Credit Deduction | Deduct on job START | Prevents race conditions, refund on failure |
 | File Upload | Server-received (not presigned URLs) | Simpler for local storage, no cloud dependency |
+| Soft Delete | Hard delete (no deletedAt) | Simpler queries. Add archive table if recovery is ever needed |
 
 ---
 
@@ -1652,9 +1536,9 @@ NEXT_PUBLIC_WS_URL=http://localhost:4000
 - User registration and login (NestJS JWT)
 - Project CRUD with multi-step creation wizard
 - Product image upload (up to 5, max 10MB each)
-- 5 video templates (Product Review, UGC Style, Problem/Solution, Flash Sale, Feature Showcase)
+- 1 video template (Product Review — add more based on customer feedback)
 - Full generation pipeline: Analyze → Angle → Script → Voice → Subtitle → Render
-- Real-time progress tracking via WebSocket
+- Real-time progress tracking via REST polling (every 2s via TanStack Query)
 - In-browser video preview
 - MP4 download
 - Credit system (admin grants credits manually via DB, 10 free credits on signup)
@@ -1712,10 +1596,12 @@ NEXT_PUBLIC_WS_URL=http://localhost:4000
 
 1. **S3-compatible storage migration**: `StorageProvider` interface is in place from day 1. Implement `S3StorageProvider` and swap via env var. No business code changes needed.
 
-2. **Provider expansion**: Adding Claude for script or ElevenLabs for voice is a new file + factory entry. No pipeline code changes.
+2. **Provider expansion**: Adding Claude for script or ElevenLabs for voice is a new file + factory entry. No pipeline code changes. Add `ImageProvider` and `VideoProvider` interfaces when those features are built.
 
 3. **Billing/Stripe integration**: Add `CreditTransaction` and `SubscriptionPlan` models back. Stripe webhook creates `CreditTransaction` on `checkout.session.completed`. Estimated 2-3 days of work once revenue is proven.
 
-4. **Video processing offload**: If Remotion rendering blocks the VPS CPU, spin up a second cheap VPS dedicated to rendering. The render worker connects to the same Redis for BullMQ and same storage via NFS or Rsync.
+4. **WebSocket upgrade**: If customers complain about polling latency, swap to `@nestjs/platform-socket.io`. The API structure supports this change.
 
-5. **Template marketplace**: Add `Template.authorId`, `Template.price`, `Template.downloads` to schema. Build template browser with purchase flow. Post-MVP, this requires no schema migration thanks to existing `Template` model.
+5. **Video processing offload**: If Remotion rendering blocks the VPS CPU, spin up a second cheap VPS dedicated to rendering. The worker connects to the same Redis for BullMQ and same storage via NFS or Rsync.
+
+6. **Template marketplace**: Add `Template`, `Template.authorId`, `Template.price`, `Template.downloads` models. Build template browser with purchase flow.

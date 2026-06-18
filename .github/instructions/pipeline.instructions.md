@@ -13,16 +13,14 @@ You implement and maintain the video generation pipeline workers.
 ## Pipeline Flow
 ```
 generate request → check credits → deduct → create Job records
-→ enqueue 'generation' queue, job name: 'analyze'
+→ enqueue 'video-pipeline' queue, job name: 'analyze'
 
 analyze:  LLM → write to Job.metadata → create next Job → enqueue 'script'
 script:   LLM → write to Job.metadata → create next Job → enqueue 'voice'
 voice:    TTS → save via StorageProvider → write path to metadata → enqueue 'subtitle'
 subtitle: Generate SRT → save via StorageProvider → write path → enqueue 'render'
-
-'render' queue → (separate PM2 process: apps/renderer)
 render:   Remotion renderMedia() → save MP4 via StorageProvider → enqueue 'cleanup'
-cleanup:  Update Project=COMPLETED → remove temp files → emit WebSocket event
+cleanup:  Update Project=COMPLETED → remove temp files
 ```
 
 ## Job Data Pattern
@@ -40,13 +38,9 @@ const scriptProvider = providerFactory.getScriptProvider();  // based on .env
 const voiceProvider = providerFactory.getVoiceProvider();    // based on .env
 ```
 
-## WebSocket Emit
-```typescript
-@Inject() private generationGateway: GenerationGateway;
-// this.generationGateway.emitProgress(projectId, { step: 'analyze', progress: 50 });
-```
+## Progress Tracking
+No WebSocket. Frontend polls `GET /api/projects/:id` every 2 seconds via TanStack Query's `refetchInterval`. No socket connections, no rooms, no reconnection logic.
 
 ## Concurrency & Retry
-- `generation` queue: concurrency 5, max retries 3 (5s→30s→120s)
-- `render` queue: concurrency 1, max retries 2 (30s→300s)
+- `video-pipeline` queue: concurrency 2, max retries 3 (5s→30s→120s)
 - On final failure: mark Project FAILED, refund credits

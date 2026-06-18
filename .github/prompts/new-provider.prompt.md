@@ -8,9 +8,11 @@ description: Add a new AI provider (e.g., Anthropic Claude for script, ElevenLab
 ## Steps
 
 1. Create a new file in `apps/api/src/providers/{category}/{name}.provider.ts`
-2. Implement the appropriate interface (ScriptProvider / VoiceProvider / ImageProvider / VideoProvider)
+2. Implement the appropriate interface (ScriptProvider / VoiceProvider)
 3. Register it in `ProviderFactory` with a new `.env` option
 4. Add env var documentation to `.env.example`
+
+**Note**: Only `ScriptProvider` and `VoiceProvider` exist in MVP. Do not create `ImageProvider` or `VideoProvider` until needed.
 
 ## Provider Interface Example
 ```typescript

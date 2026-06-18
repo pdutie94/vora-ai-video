@@ -1,44 +1,41 @@
 ---
 name: vora-renderer
 description: >-
-  Agent for the Remotion renderer process. Knows template structure, scene components,
-  rendering config, and how to connect to BullMQ from the separate renderer app.
-applyTo: "apps/renderer/**"
+  Agent for Remotion rendering code. Knows template structure, scene components,
+  rendering config. Rendering runs inline in the NestJS worker, not a separate process.
+applyTo: "apps/api/src/renderer/**"
 ---
 
 # Vora AI — Renderer Agent
 
 ## Architecture
-- Lives in `apps/renderer/` with its own `package.json`
-- Not part of NestJS worker — completely independent PM2 process
-- Imports: `@remotion/renderer`, `@prisma/client`, `bullmq`, shared types
-- Connects to same Redis (BullMQ) + MySQL (Prisma)
+- Runs inside the same NestJS process (`apps/api`)
+- `@remotion/renderer` package's `renderMedia()` called directly from job handler
+- No separate PM2 process — Remotion renders inline in the `video-pipeline` queue worker
+- When Remotion crashes (OOM/FFmpeg) → PM2 restarts the API process
+- For 14 renders/hr (10k videos/month), single process handles it easily
 
 ## Rendering Flow
 ```
-'render' queue job received
+Job 'render' received (same queue as analyze/script/voice/subtitle)
 → Read accumulated data from DB (Job.metadata)
 → Build composition input props
 → Call renderMedia({ compositionId, inputProps, ... })
 → MP4 written to temp → save via StorageProvider → update DB → enqueue 'cleanup'
 ```
 
-## Template Structure
+## Template Structure (MVP — 1 Template)
 ```
-apps/renderer/src/templates/
+apps/api/src/renderer/
 ├── registry.ts              # Maps slug → Composition
-├── product-review.tsx       # Hook → Showcase → Verdict → CTA (30s)
-├── ugc-style.tsx            # Hook → Unboxing → Up close → CTA (20s)
-├── problem-solution.tsx     # Problem → Solution → Features → CTA (25s)
-├── flash-sale.tsx           # Timer → Offer → Product → CTA (15s)
-└── features-showcase.tsx    # Intro → Feature 1 → Feature 2 → Outro (40s)
-
-scenes/
-├── title-scene.tsx          # Animated title card
-├── image-scene.tsx          # Product image + overlay
-├── text-scene.tsx           # Script line display
-├── cta-scene.tsx            # Call-to-action card
-└── outro-scene.tsx          # Brand/closing card
+├── templates/
+│   └── product-review.tsx   # Hook → Showcase → Verdict → CTA (30s)
+└── scenes/
+    ├── title-scene.tsx      # Animated title card
+    ├── image-scene.tsx      # Product image + overlay
+    ├── text-scene.tsx       # Script line display
+    ├── cta-scene.tsx        # Call-to-action card
+    └── outro-scene.tsx      # Brand/closing card
 ```
 
 ## Rendering Config
@@ -49,16 +46,16 @@ scenes/
 | Codec | h264 |
 | Video bitrate | 8 Mbps |
 | Audio codec | aac |
-| Duration | 15-60s |
+| Duration | 30s (1 template) |
 
-## Input Props (all templates)
+## Input Props
 ```typescript
 interface CompositionProps {
   productName: string;
   productDescription: string;
   marketingAngle: string;
   script: string[];
-  images: string[];       // File paths (local or S3)
+  images: string[];       // File paths (local)
   voiceOverPath: string;  // Audio file path
   subtitleSrt: string;    // SRT file path
 }
